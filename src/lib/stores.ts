@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import type { Space, Page, PageVersion } from './api';
+import type { Space, Page, PageVersion, SearchResult } from './api';
 
 export const spaces = writable<Space[]>([]);
 export const currentSpace = writable<Space | null>(null);
@@ -59,6 +59,10 @@ export const activityLog = writable<ActivityEvent[]>([]);
 
 // ── Synthesis signal ───────────────────────────────────────────────────────────
 export const lastSynthesisAt = writable<number>(0);
+
+// ── Search state (shared between Sidebar input and main panel display) ─────────
+export const searchQuery = writable<string>('');
+export const searchResults = writable<SearchResult[]>([]);
 
 let _seq = 0;
 export function activityStart(label: string): string {

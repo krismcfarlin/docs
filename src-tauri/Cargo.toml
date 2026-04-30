@@ -36,6 +36,7 @@ hex = "0.4"
 urlencoding = "2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+bamako-synthesis = { path = "../crates/bamako-synthesis" }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }

@@ -36,6 +36,8 @@ pub struct Page {
     pub permission_level: String,
     /// When this page was last pulled from remote
     pub last_synced_at: Option<String>,
+    /// 1 = entity wiki page, 0 = normal page
+    pub is_entity_page: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

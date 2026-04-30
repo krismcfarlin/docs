@@ -1,25 +1,53 @@
 <script lang="ts">
   import { currentPage, currentVersion, versions, pages, readMode, activityStart, activityDone, activityError, currentSpace, lastSynthesisAt } from '$lib/stores';
-  import { publishVersion, freezeVersion, forkVersion, listPageVersions, savePageVersion, getPageVersion, vectorizePage, renamePage, synthesizePage } from '$lib/api';
+  import { publishVersion, freezeVersion, forkVersion, listPageVersions, savePageVersion, getPageVersion, vectorizePage, renamePage, synthesizePage, demoteEntityPage } from '$lib/api';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getCurrentWebview } from '@tauri-apps/api/webview';
   import { save as saveDialog } from '@tauri-apps/plugin-dialog';
   import DiffModal from './DiffModal.svelte';
-  import { BookOpen, Pencil, GitFork, Globe, Lock, GitCompare, Download, ChevronDown, Sparkles } from 'lucide-svelte';
+  import { BookOpen, Pencil, GitFork, Globe, GitCompare, Download, ChevronDown, Sparkles, Trash2 } from 'lucide-svelte';
 
   let synthesizing = $state(false);
 
   async function handleSynthesize() {
     if (!$currentPage || !$currentSpace || $currentSpace.source !== 'remote') return;
     synthesizing = true;
-    const id = activityStart(`Synthesize "${$currentPage.title}"`);
+    const pageId = $currentPage.id;
+    const id = activityStart(`Process "${$currentPage.title}"`);
+
+    // Track per-stage progress events from Rust
+    let stageActivityId: string | null = null;
+    const unlisten = await listen<{ page_id: string; stage: string; label: string }>('synthesis:stage', (event) => {
+      const { page_id, stage, label } = event.payload;
+      if (page_id !== pageId) return;
+      if (stageActivityId) {
+        if (stage === 'done') {
+          activityDone(stageActivityId, label);
+          stageActivityId = null;
+        } else {
+          activityDone(stageActivityId, label);
+          stageActivityId = activityStart(label);
+        }
+      } else {
+        stageActivityId = activityStart(label);
+      }
+    });
+
     try {
-      await synthesizePage($currentSpace.id, $currentPage.id);
+      await synthesizePage($currentSpace.id, pageId);
       $lastSynthesisAt = Date.now();
-      activityDone(id, 'Insights ready');
+      if (stageActivityId) { activityDone(stageActivityId, 'Done'); stageActivityId = null; }
+      // Also vectorize so page is searchable
+      if ($currentVersion) {
+        await vectorizePage($currentVersion.id, $currentPage!.space_id).catch(() => {});
+      }
+      activityDone(id, 'Done');
     } catch (e) {
+      if (stageActivityId) { activityError(stageActivityId, String(e)); stageActivityId = null; }
       activityError(id, String(e));
     } finally {
+      unlisten();
       synthesizing = false;
     }
   }
@@ -68,27 +96,6 @@
     }
   }
 
-  async function handleFreeze() {
-    if (!$currentVersion) return;
-    const title = $currentVersion.title ?? 'Untitled';
-    const freezeId = activityStart(`Freeze "${title}"`);
-    try {
-      await freezeVersion($currentVersion.id, $currentPage!.space_id);
-      $currentVersion = { ...$currentVersion, is_frozen: true };
-      activityDone(freezeId);
-    } catch (e) {
-      activityError(freezeId, String(e));
-      return;
-    }
-    const embedId = activityStart(`Embed "${title}"`);
-    try {
-      await vectorizePage($currentVersion.id, $currentPage!.space_id);
-      activityDone(embedId, 'Indexed in VelesDB');
-    } catch (e) {
-      activityError(embedId, String(e));
-    }
-  }
-
   async function handleFork() {
     if (!$currentVersion) return;
     const newVer = await forkVersion($currentVersion.id, $currentPage!.space_id);
@@ -106,10 +113,22 @@
 
   function versionLabel(ver: typeof $versions[0]) {
     const parts = [`v${ver.version_num}`];
-    if (ver.is_frozen) parts.push('Frozen');
-    else if (ver.is_published) parts.push('Published');
+    if (ver.is_published) parts.push('Published');
     else parts.push('Draft');
     return parts.join(' · ');
+  }
+
+  async function handleDemote(): Promise<void> {
+    if (!$currentPage || !$currentSpace) return;
+    const id = activityStart(`Demoting: ${$currentPage.title}…`);
+    try {
+      await demoteEntityPage($currentSpace.id, $currentPage.id);
+      $currentPage = null;
+      $currentVersion = null;
+      activityDone(id, 'Wiki page removed');
+    } catch (e) {
+      activityError(id, String(e));
+    }
   }
 </script>
 
@@ -126,15 +145,19 @@
       onblur={async (e) => {
         if (!$currentVersion || !$currentPage) return;
         const newTitle = (e.currentTarget as HTMLInputElement).value.trim() || 'Untitled';
+        const pageId = $currentPage.id;
+        const spaceId = $currentPage.space_id;
         const content = $currentVersion.content ?? '';
         const textContent = $currentVersion.text_content ?? '';
-        await Promise.all([
-          savePageVersion($currentVersion.id, newTitle, content, textContent, $currentPage.space_id),
-          renamePage($currentPage.id, newTitle, $currentPage.space_id),
-        ]);
+        // Update store immediately so sidebar reflects change
         $currentVersion = { ...$currentVersion, title: newTitle };
         $currentPage = { ...$currentPage, title: newTitle };
-        $pages = $pages.map(p => p.id === $currentPage!.id ? { ...p, title: newTitle } : p);
+        $pages = $pages.map(p => p.id === pageId ? { ...p, title: newTitle } : p);
+        // Persist in background
+        Promise.all([
+          renamePage(pageId, newTitle, spaceId),
+          savePageVersion($currentVersion.id, newTitle, content, textContent, spaceId, $currentVersion.updated_at ?? ''),
+        ]).catch(e => console.error('[rename] failed to persist:', e));
       }}
       class="flex-1 bg-transparent text-base font-semibold outline-none min-w-0 truncate transition-colors"
       style="color: var(--color-on-surface); border-bottom: 1px solid transparent;"
@@ -183,10 +206,7 @@
     </div>
 
     <!-- Status badge -->
-    {#if $currentVersion.is_frozen}
-      <span class="text-xs px-2.5 py-0.5 rounded-full font-medium text-blue-600 dark:text-blue-400"
-        style="background: var(--color-surface-lo); border: 1px solid currentColor; opacity: 0.9;">Frozen</span>
-    {:else if $currentVersion.is_published}
+    {#if $currentVersion.is_published}
       <span class="text-xs px-2.5 py-0.5 rounded-full font-medium text-green-600 dark:text-green-400"
         style="background: var(--color-surface-lo); border: 1px solid currentColor; opacity: 0.9;">Published</span>
     {:else}
@@ -229,23 +249,13 @@
 
       <button
         onclick={handlePublish}
-        disabled={$currentVersion.is_published || $currentVersion.is_frozen}
+        disabled={$currentVersion.is_published}
         class="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         style="color: var(--color-on-muted);"
         title="Publish version"
       >
         <Globe size={12} />
         Publish
-      </button>
-
-      <button
-        onclick={handleFreeze}
-        class="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors"
-        style="color: var(--color-on-muted);"
-        title={$currentVersion.is_frozen ? 'Re-freeze and re-index' : 'Freeze and index'}
-      >
-        <Lock size={12} />
-        {$currentVersion.is_frozen ? 'Re-freeze' : 'Freeze'}
       </button>
 
       {#if $versions.length > 1}
@@ -266,10 +276,22 @@
           disabled={synthesizing}
           class="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors disabled:opacity-40"
           style="color: var(--color-on-muted);"
-          title="Analyze this document with AI"
+          title="Process this document with AI"
         >
           <Sparkles size={12} />
-          {synthesizing ? 'Analyzing…' : 'Analyze'}
+          {synthesizing ? 'Processing…' : 'Process'}
+        </button>
+      {/if}
+
+      {#if $currentPage?.is_entity_page === 1}
+        <button
+          onclick={handleDemote}
+          class="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg transition-colors"
+          style="color: #dc2626;"
+          title="Remove this wiki page and reset the entity"
+        >
+          <Trash2 size={12} />
+          Demote
         </button>
       {/if}
 

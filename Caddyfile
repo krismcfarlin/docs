@@ -1,0 +1,8 @@
+# Bamako sqld reverse proxy snippet
+# Import this into your main Caddyfile:
+#   import /etc/caddy/conf.d/bamako.caddy
+# or append the block below to your existing Caddyfile.
+
+docs.yourdomain.com {
+    reverse_proxy localhost:8092
+}

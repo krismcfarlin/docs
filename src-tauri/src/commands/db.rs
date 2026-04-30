@@ -276,7 +276,10 @@ pub(crate) async fn get_or_open_space_db(
         )
     };
 
-    let db = if source == "remote" {
+    if source == "remote" {
+        // Remote DBs are NOT cached — Hrana streams expire after idle and cached
+        // connections produce STREAM_EXPIRED errors. Builder::new_remote is cheap
+        // (no connection until first query), so we just build fresh each call.
         let url = server_url
             .filter(|s| !s.is_empty())
             .ok_or("Remote space missing server_url")?;
@@ -290,8 +293,12 @@ pub(crate) async fn get_or_open_space_db(
                 e.to_string()
             })?;
         eprintln!("[space_db] remote DB opened OK for space_id={}", space_id);
-        db
-    } else {
+        // Run migrations without caching
+        run_space_migrations(&db).await?;
+        return Ok(Arc::new(db));
+    }
+
+    let db = {
         let path = space_db_path(space_id);
         std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap())
             .map_err(|e| e.to_string())?;
@@ -831,7 +838,8 @@ pub async fn get_pages(state: State<'_, AppState>, space_id: String) -> Result<V
         eprintln!("[get_pages] remote space — querying ALL non-deleted pages (no space_id filter)");
         conn.query(
             "SELECT id, title, space_id, creator_id, parent_page_id, sort_order, created_at, updated_at, \
-                    source, remote_id, permission_level, last_synced_at \
+                    source, remote_id, permission_level, last_synced_at, \
+                    COALESCE(is_entity_page, 0) \
              FROM pages WHERE deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC",
             (),
         )
@@ -841,7 +849,8 @@ pub async fn get_pages(state: State<'_, AppState>, space_id: String) -> Result<V
         eprintln!("[get_pages] local space — querying pages WHERE space_id={}", space_id);
         conn.query(
             "SELECT id, title, space_id, creator_id, parent_page_id, sort_order, created_at, updated_at, \
-                    source, remote_id, permission_level, last_synced_at \
+                    source, remote_id, permission_level, last_synced_at, \
+                    COALESCE(is_entity_page, 0) \
              FROM pages WHERE space_id = ?1 AND deleted_at IS NULL ORDER BY sort_order ASC, created_at ASC",
             libsql::params![space_id.clone()],
         )
@@ -919,6 +928,7 @@ pub async fn create_page(
         remote_id: None,
         permission_level: "owner".to_string(),
         last_synced_at: None,
+        is_entity_page: 0,
     })
 }
 
@@ -1894,6 +1904,7 @@ fn build_page(row: &libsql::Row) -> Result<Page, String> {
             .get::<String>(10)
             .unwrap_or_else(|_| "owner".to_string()),
         last_synced_at: row.get(11).map_err(|e| e.to_string())?,
+        is_entity_page: row.get::<i64>(12).unwrap_or(0),
     })
 }
 

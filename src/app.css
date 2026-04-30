@@ -63,6 +63,34 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--color-surface-hi); border-radius: 3px; }
 
+/* ── Light mode editor overrides (beat milkdown frame-dark.css) ─────────── */
+html.light .milkdown,
+html.light .milkdown .editor,
+html.light .milkdown .ProseMirror {
+  color: #2c3437 !important;
+  background: transparent !important;
+}
+html.light .milkdown h1,
+html.light .milkdown h2,
+html.light .milkdown h3,
+html.light .milkdown h4,
+html.light .milkdown h5,
+html.light .milkdown h6 {
+  color: #1a2224 !important;
+}
+html.light .milkdown p,
+html.light .milkdown li,
+html.light .milkdown td,
+html.light .milkdown th,
+html.light .milkdown blockquote {
+  color: #2c3437 !important;
+}
+html.light .milkdown a { color: #0053dc !important; }
+html.light .milkdown code { background: #e3e9ed !important; color: #0053dc !important; }
+html.light .milkdown pre { background: #f0f4f7 !important; }
+html.light .milkdown pre code { background: transparent !important; color: #2c3437 !important; }
+html.light .milkdown [style*="color"] { color: #2c3437 !important; }
+
 /* ── Print ───────────────────────────────────────────────────────────────── */
 @media print {
   aside, [data-topbar] { display: none !important; }

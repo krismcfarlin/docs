@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { listen } from '@tauri-apps/api/event';
   import {
     spaces, currentSpace, pages, currentPage, currentVersion, versions,
     theme, searchFocusTick, userName, userEmail,
     activityStart, activityDone, activityError,
+    searchQuery as globalSearchQuery, searchResults as globalSearchResults,
   } from '$lib/stores';
   import {
     getSpaces, createSpace, getPages, createPage,
@@ -12,7 +14,7 @@
     moveSpace, reorderSpaces, reorderPages,
     getTrashPages, restorePage, permanentDeletePage,
     recordPageAccess, connectRemoteSpace,
-    getPageSynthesis, synthesizePage, freezeVersion, vectorizePage, updateSpaceOverview,
+    synthesizePage, vectorizePage, updateSpaceOverview, forceResynthesize, createWikiStubs,
     movePageToSpace,
   } from '$lib/api';
   import ImportModal from './ImportModal.svelte';
@@ -36,9 +38,8 @@
   let moveModalPage   = $state<Page | null>(null);
   let moveTargetId    = $state('');
 
-  let searchQuery   = $state('');
-  let searchResults = $state<SearchResult[]>([]);
-  let searching     = $state(false);
+  let localSearchQuery = $state('');
+  let searching        = $state(false);
   let searchTimer: ReturnType<typeof setTimeout>;
   let searchInput: HTMLInputElement;
 
@@ -69,15 +70,22 @@
 
   let expandedIds      = $state<Set<string>>(new Set());
   let expandedSpaceIds = $state<Set<string>>(new Set());
-  let newChildState    = $state<Record<string, { title: string; show: boolean }>>({});
 
   let renamingSpaceId   = $state<string | null>(null);
   let renamingSpaceName = $state('');
 
-  // Per-space inline forms
-  let newPageForSpace    = $state<Record<string, boolean>>({});
-  let newSubSpaceFor     = $state<Record<string, { name: string; error: string }>>({});
+  // Per-space connect form (remote connect flow — kept separate)
   let connectChildFor    = $state<Record<string, { url: string; name: string; token: string; permission: string; connecting: boolean }>>({});
+
+  // Create-item modal
+  type CreateIntent =
+    | { kind: 'page-in-space'; spaceId: string; spaceName: string }
+    | { kind: 'subspace'; parentSpaceId: string; parentSpaceName: string }
+    | { kind: 'child-page'; parentPageId: string; parentPageTitle: string; spaceId: string };
+
+  let createIntent = $state<CreateIntent | null>(null);
+  let createName   = $state('');
+  let createError  = $state('');
 
   let dragId     = $state<string | null>(null);
   let dragType   = $state<'space' | 'page' | null>(null);
@@ -123,11 +131,6 @@
   function toggle(set: Set<string>, id: string): Set<string> {
     const next = new Set(set); next.has(id) ? next.delete(id) : next.add(id); return next;
   }
-  function showNewChild(pid: string) {
-    newChildState = { ...newChildState, [pid]: { title: '', show: true } };
-    expandedIds = new Set([...expandedIds, pid]);
-  }
-  function hideNewChild(pid: string) { const s = { ...newChildState }; delete s[pid]; newChildState = s; }
 
   // ── Drag ──────────────────────────────────────────────────────────────────
   function dropPos(e: DragEvent): 'above' | 'below' | 'inside' {
@@ -191,13 +194,15 @@
 
   // ── App handlers ──────────────────────────────────────────────────────────
   async function selectSpace(space: Space) {
+    console.log('[load] selecting space', space.id, space.name, 'source:', space.source);
     $currentSpace = space; $currentPage = null; $currentVersion = null;
-    expandedIds = new Set(); newChildState = {};
+    expandedIds = new Set();
     showTrash = false; trashPages = [];
     $pages = [];
     const actId = activityStart(`Loading pages: ${space.name}…`);
     try {
       $pages = await getPages(space.id);
+      console.log('[load] pages loaded for', space.name, ':', $pages.length, 'total,', $pages.filter(p => !p.is_entity_page).length, 'content pages,', $pages.filter(p => p.is_entity_page).length, 'wiki pages');
       activityDone(actId, `Loaded ${$pages.length} pages in ${space.name}`);
     } catch (e) {
       activityError(actId, `Failed to load pages for ${space.name}: ${e}`);
@@ -206,6 +211,7 @@
   }
 
   async function selectPage(page: Page) {
+    console.log('[load] selecting page', page.id, page.title, 'in space', $currentSpace?.name);
     $currentPage = page;
     // Use the local registry space id (not page.space_id which may be from another
     // instance or the seed) so get_or_open_space_db can find the connection.
@@ -228,20 +234,6 @@
     } catch (e) { console.error(e); }
   }
 
-  function showNewPageFor(spaceId: string) {
-    newPageForSpace = { ...newPageForSpace, [spaceId]: true };
-  }
-  function hideNewPageFor(spaceId: string) {
-    newPageForSpace = { ...newPageForSpace, [spaceId]: false };
-  }
-  function showNewSubSpaceFor(spaceId: string) {
-    newSubSpaceFor = { ...newSubSpaceFor, [spaceId]: { name: '', error: '' } };
-  }
-  function hideNewSubSpaceFor(spaceId: string) {
-    const s = { ...newSubSpaceFor };
-    delete s[spaceId];
-    newSubSpaceFor = s;
-  }
   function showConnectChildFor(spaceId: string) {
     connectChildFor = { ...connectChildFor, [spaceId]: { url: '', name: '', token: '', permission: 'read', connecting: false } };
   }
@@ -251,38 +243,37 @@
     connectChildFor = s;
   }
 
-  async function handleCreatePageForSpace(spaceId: string, title: string) {
-    if (!title.trim()) return;
-    try {
-      const page = await createPage(title.trim(), spaceId, undefined);
-      if ($currentSpace?.id === spaceId) {
+  async function handleConfirmCreate() {
+    const name = createName.trim();
+    if (!name) { createError = 'Name required'; return; }
+    createError = '';
+    const intent = createIntent;
+    createIntent = null;
+    createName = '';
+
+    if (intent?.kind === 'page-in-space') {
+      try {
+        const page = await createPage(name, intent.spaceId, undefined);
+        if ($currentSpace?.id === intent.spaceId) $pages = [...$pages, page];
+        console.log('[create] page in space', intent.spaceId, '->', page.id, page.title);
+      } catch (e) { console.error('[create] page failed', e); }
+    } else if (intent?.kind === 'subspace') {
+      const dup = $spaces.some(s => s.parent_space_id === intent.parentSpaceId && s.name.toLowerCase() === name.toLowerCase());
+      if (dup) { createIntent = intent; createName = name; createError = `"${name}" already exists here`; return; }
+      try {
+        await createSpace(name, undefined, intent.parentSpaceId);
+        $spaces = await getSpaces();
+        expandedSpaceIds = new Set([...expandedSpaceIds, intent.parentSpaceId]);
+        console.log('[create] subspace under', intent.parentSpaceId, name);
+      } catch (e) { console.error('[create] subspace failed', e); }
+    } else if (intent?.kind === 'child-page') {
+      try {
+        const page = await createPage(name, intent.spaceId, intent.parentPageId);
         $pages = [...$pages, page];
-      }
-      hideNewPageFor(spaceId);
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  async function handleCreateSubSpaceFor(spaceId: string) {
-    const entry = newSubSpaceFor[spaceId];
-    if (!entry?.name.trim()) return;
-    const trimmed = entry.name.trim();
-
-    // Unique name check within same parent
-    const duplicate = $spaces.some(s => s.parent_space_id === spaceId && s.name.toLowerCase() === trimmed.toLowerCase());
-    if (duplicate) {
-      newSubSpaceFor = { ...newSubSpaceFor, [spaceId]: { ...entry, error: `"${trimmed}" already exists here` } };
-      return;
-    }
-
-    try {
-      await createSpace(trimmed, undefined, spaceId);
-      $spaces = await getSpaces();
-      expandedSpaceIds = new Set([...expandedSpaceIds, spaceId]);
-      hideNewSubSpaceFor(spaceId);
-    } catch (e) {
-      newSubSpaceFor = { ...newSubSpaceFor, [spaceId]: { ...entry, error: String(e) } };
+        expandedIds = new Set([...expandedIds, intent.parentPageId]);
+        await selectPage(page);
+        console.log('[create] child page under', intent.parentPageId, '->', page.id, page.title);
+      } catch (e) { console.error('[create] child page failed', e); }
     }
   }
 
@@ -299,28 +290,6 @@
     } catch (e) {
       console.error(e);
     }
-  }
-
-  async function handleCreateTopPage() {
-    if (!$currentSpace) return;
-    const title = (newChildState['__root__']?.title ?? '').trim();
-    if (!title) return;
-    try {
-      const page = await createPage(title, $currentSpace.id, undefined);
-      $pages = [...$pages, page]; hideNewChild('__root__'); await selectPage(page);
-    } catch (e) { console.error(e); }
-  }
-
-  async function handleCreateChildPage(parentId: string) {
-    if (!$currentSpace) return;
-    const title = (newChildState[parentId]?.title ?? '').trim();
-    if (!title) return;
-    try {
-      const page = await createPage(title, $currentSpace.id, parentId);
-      $pages = [...$pages, page]; hideNewChild(parentId);
-      expandedIds = new Set([...expandedIds, parentId]);
-      await selectPage(page);
-    } catch (e) { console.error(e); }
   }
 
   async function handleSync() {
@@ -374,48 +343,82 @@
       activityError(actId, `Load failed: ${e}`);
       return;
     }
+    spacePages = spacePages.filter(p => !p.is_entity_page);
     if (spacePages.length === 0) {
       activityDone(actId, 'No pages in this space');
       return;
     }
     activityDone(actId, `Processing ${spacePages.length} page${spacePages.length !== 1 ? 's' : ''}…`);
     const actId2 = activityStart(`Processing ${spacePages.length} page${spacePages.length !== 1 ? 's' : ''}…`);
-    let analyzed = 0, frozen = 0, skipped = 0, failed = 0;
+
+    // Wire up per-stage progress events from Rust
+    const stageActivities = new Map<string, string>(); // page_id → activity_id
+    const unlisten = await listen<{ page_id: string; stage: string; label: string }>('synthesis:stage', (event) => {
+      const { page_id, stage, label } = event.payload;
+      const existingId = stageActivities.get(page_id);
+      if (existingId) {
+        if (stage === 'done') {
+          activityDone(existingId, label);
+          stageActivities.delete(page_id);
+        } else {
+          activityDone(existingId, label);
+          const newId = activityStart(label);
+          stageActivities.set(page_id, newId);
+        }
+      } else {
+        const id = activityStart(label);
+        stageActivities.set(page_id, id);
+      }
+    });
+
+    let processed = 0, skipped = 0, failed = 0;
     for (const page of spacePages) {
       const pageLabel = page.title ?? 'Untitled';
-      const pageId = activityStart(`Synthesizing: ${pageLabel}…`);
       try {
-        // Analyze (skip if synthesis is current)
-        const synth = await getPageSynthesis(spaceId, page.id).catch(() => null);
-        if (!synth || !page.updated_at || synth.synthesized_at < page.updated_at) {
-          await synthesizePage(spaceId, page.id);
-          analyzed++;
-          activityDone(pageId, `✓ Synthesized: ${pageLabel}`);
-        } else {
-          activityDone(pageId, `↷ Skipped (up-to-date): ${pageLabel}`);
-        }
-        // Freeze + index (skip if already frozen)
+        // Let Rust decide skip vs. run via content hash — no JS pre-check
+        const result = await synthesizePage(spaceId, page.id);
+        // Vectorize so page is searchable
         const ver = await getPageVersion(page.id, spaceId);
-        if (ver && !ver.is_frozen) {
-          await freezeVersion(ver.id, spaceId);
-          await vectorizePage(ver.id, spaceId);
-          frozen++;
-        } else {
-          skipped++;
-        }
+        if (ver) await vectorizePage(ver.id, spaceId).catch(() => {});
+        // Rust emits synthesis:stage 'done' with "Up to date: X" label when skipped
+        const wasSkipped = stageActivities.has(page.id) === false;
+        const lingering = stageActivities.get(page.id);
+        if (lingering) { activityDone(lingering, `Done: ${pageLabel}`); stageActivities.delete(page.id); }
+        processed++;
       } catch (e) {
         failed++;
-        activityError(pageId, `✕ Failed: ${pageLabel} — ${e}`);
+        const lingering = stageActivities.get(page.id);
+        if (lingering) { activityError(lingering, `✕ Failed: ${pageLabel} — ${e}`); stageActivities.delete(page.id); }
+        else { activityError(activityStart(`✕ Failed: ${pageLabel}`), `${e}`); }
       }
     }
-    const summary = `Done: ${analyzed} synthesized, ${frozen} indexed, ${skipped} up-to-date, ${failed} failed`;
-    if (failed > 0 && analyzed === 0 && frozen === 0) {
+
+    unlisten();
+
+    const summary = `Done: ${processed} processed, ${failed} failed`;
+    if (failed > 0 && processed === 0) {
       activityError(actId2, summary);
     } else {
       activityDone(actId2, summary);
     }
-    // Always try to update overview if anything was analyzed
-    if (analyzed > 0) {
+    // Promote any unpromoted entities as stub wiki pages
+    const stubsId = activityStart('Creating wiki stubs…');
+    try {
+      const n = await createWikiStubs(spaceId);
+      activityDone(stubsId, `Wiki: ${n} pages created`);
+    } catch (e) {
+      activityError(stubsId, `Wiki stubs failed: ${e}`);
+    }
+
+    // Reload pages so wiki stubs appear in sidebar
+    const reloaded = await getPages(spaceId).catch(() => $pages);
+    $pages = reloaded;
+    // Auto-expand Wiki root so entity pages are immediately visible
+    const wikiRoot = reloaded.find(p => p.title === 'Wiki' && !p.parent_page_id && !p.is_entity_page);
+    if (wikiRoot) expandedIds = new Set([...expandedIds, wikiRoot.id]);
+
+    // Always try to update overview after processing
+    if (processed > 0) {
       const ovId = activityStart('Updating knowledge overview…');
       try {
         await updateSpaceOverview(spaceId);
@@ -465,20 +468,26 @@
 
   function scheduleSearch(q: string) {
     clearTimeout(searchTimer);
-    if (!q.trim() || !$currentSpace) { searchResults = []; return; }
+    if (!q.trim() || !$currentSpace) { $globalSearchResults = []; $globalSearchQuery = ''; return; }
     searchTimer = setTimeout(async () => {
       searching = true;
-      try { searchResults = await searchSimilarPages($currentSpace!.id, q.trim()); }
-      catch { searchResults = []; }
+      try {
+        const results = await searchSimilarPages($currentSpace!.id, q.trim());
+        $globalSearchResults = results;
+        $globalSearchQuery = q.trim();
+      }
+      catch { $globalSearchResults = []; $globalSearchQuery = ''; }
       finally { searching = false; }
     }, 400);
   }
   async function openSearchResult(r: SearchResult) {
-    searchQuery = ''; searchResults = [];
+    localSearchQuery = '';
+    $globalSearchQuery = '';
+    $globalSearchResults = [];
     const page = $pages.find(p => p.id === r.page_id);
     if (page) await selectPage(page);
   }
-  $effect(() => { scheduleSearch(searchQuery); });
+  $effect(() => { scheduleSearch(localSearchQuery); });
 
   // Avatar initial
   function initial(name: string) { return (name || 'Y')[0].toUpperCase(); }
@@ -502,36 +511,19 @@
       <Search size={13} style="color:var(--color-on-muted); flex-shrink:0;" />
       <input
         type="text"
-        bind:value={searchQuery}
+        bind:value={localSearchQuery}
         bind:this={searchInput}
         placeholder="Search… (⌘K)"
         class="flex-1 bg-transparent text-sm outline-none min-w-0"
         style="color:var(--color-on-surface);"
-        onkeydown={(e) => { if (e.key === 'Escape') { searchQuery = ''; searchResults = []; } }}
+        onkeydown={(e) => { if (e.key === 'Escape') { localSearchQuery = ''; $globalSearchQuery = ''; $globalSearchResults = []; } }}
       />
       {#if searching}<span class="text-xs" style="color:var(--color-on-muted);">…</span>{/if}
     </div>
 
-    {#if searchResults.length > 0}
-      <div class="absolute left-4 right-4 top-full mt-1 z-50 rounded-xl overflow-hidden shadow-card" style="background:var(--color-surface); border:1px solid var(--color-border);">
-        {#each searchResults as r}
-          <button onclick={() => openSearchResult(r)}
-            class="w-full text-left px-3 py-2.5 transition-colors border-b last:border-0"
-            style="border-color:var(--color-border);"
-            onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-lo)'}
-            onmouseleave={(e) => (e.currentTarget as HTMLElement).style.background = 'transparent'}
-          >
-            <div class="flex items-center justify-between gap-2 mb-0.5">
-              <span class="text-xs font-semibold text-on-surface truncate">{r.title}</span>
-              <span class="text-xs font-mono shrink-0" style="color:var(--color-on-muted);">{(r.score * 100).toFixed(0)}%</span>
-            </div>
-            {#if r.snippet}<p class="text-xs line-clamp-2" style="color:var(--color-on-muted);">{r.snippet}</p>{/if}
-          </button>
-        {/each}
-      </div>
-    {:else if searchQuery && !searching}
+    {#if localSearchQuery && !searching && $globalSearchResults.length === 0}
       <div class="absolute left-4 right-4 top-full mt-1 z-50 rounded-xl px-3 py-2.5 shadow-card" style="background:var(--color-surface); border:1px solid var(--color-border);">
-        <span class="text-xs" style="color:var(--color-on-muted);">No frozen pages match. Freeze a page to index it.</span>
+        <span class="text-xs" style="color:var(--color-on-muted);">No results. Process a page first to make it searchable.</span>
       </div>
     {/if}
   </div>
@@ -539,7 +531,7 @@
   <!-- Scrollable space + page tree -->
   <div class="flex-1 overflow-y-auto px-3 pb-2">
 
-    {#each spaceNodes() as sn (sn.space.id)}
+    {#each spaceNodes().filter(sn => sn.space.name !== 'Wiki') as sn (sn.space.id)}
       {@const si = sn.depth * 10}
       {@const isSel = $currentSpace?.id === sn.space.id}
 
@@ -591,7 +583,7 @@
 
         <!-- Hover actions -->
         <div class="flex opacity-0 group-hover:opacity-100 transition-all shrink-0 gap-0.5 pr-1">
-          <button onclick={() => showNewPageFor(sn.space.id)}
+          <button onclick={() => { createIntent = { kind: 'page-in-space', spaceId: sn.space.id, spaceName: sn.space.name }; createName = ''; createError = ''; }}
             class="w-6 h-6 flex items-center justify-center rounded-lg transition-colors"
             style="color:var(--color-on-muted);"
             onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-lo)'}
@@ -603,7 +595,7 @@
             onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-lo)'}
             onmouseleave={(e) => (e.currentTarget as HTMLElement).style.background = 'transparent'}
             title="Import"><UploadCloud size={11} /></button>
-          <button onclick={() => showNewSubSpaceFor(sn.space.id)}
+          <button onclick={() => { createIntent = { kind: 'subspace', parentSpaceId: sn.space.id, parentSpaceName: sn.space.name }; createName = ''; createError = ''; }}
             class="w-6 h-6 flex items-center justify-center rounded-lg transition-colors"
             style="color:var(--color-on-muted);"
             onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-lo)'}
@@ -644,49 +636,20 @@
             title="Analyze and index all pages">
             <Sparkles size={10} />Process all
           </button>
-        </div>
-      {/if}
-
-      <!-- Per-space inline forms (shown regardless of selection) -->
-      {#if newPageForSpace[sn.space.id]}
-        {@const formIndent = si + 28}
-        <div class="flex items-center gap-1 pr-2 py-1 mb-1" style="padding-left:{formIndent}px">
-          <input type="text"
-            placeholder="Page title"
-            onkeyup={(e) => {
-              const inp = e.currentTarget as HTMLInputElement;
-              if (e.key === 'Enter') { handleCreatePageForSpace(sn.space.id, inp.value); inp.value = ''; }
-              else if (e.key === 'Escape') hideNewPageFor(sn.space.id);
+          <button onclick={async () => {
+              const id = activityStart('Resetting…');
+              try {
+                await forceResynthesize(sn.space.id);
+                activityDone(id, 'Reset done — click Process all');
+              } catch (e) { activityError(id, String(e)); }
             }}
-            class="flex-1 text-xs px-2 py-1.5 rounded-lg outline-none"
-            style="background:var(--color-surface-lo); color:var(--color-on-surface); border:1px solid var(--color-primary);"
-            use:focusOnMount />
-          <button onclick={(e) => {
-            const inp = (e.currentTarget as HTMLElement).previousElementSibling as HTMLInputElement;
-            handleCreatePageForSpace(sn.space.id, inp.value);
-          }} class="text-xs px-2 py-1 rounded-lg font-semibold text-white" style="background:var(--color-primary);">✓</button>
-          <button onclick={() => hideNewPageFor(sn.space.id)} class="text-xs px-1.5 py-1" style="color:var(--color-on-muted);">✕</button>
-        </div>
-      {/if}
-
-      {#if newSubSpaceFor[sn.space.id]}
-        {@const formIndent = si + 20}
-        <div class="flex flex-col gap-0.5 pr-2 py-1 mb-1" style="padding-left:{formIndent}px">
-          <div class="flex items-center gap-1">
-            <input type="text"
-              bind:value={newSubSpaceFor[sn.space.id].name}
-              placeholder="Folder name"
-              onkeyup={(e) => { if (e.key === 'Enter') handleCreateSubSpaceFor(sn.space.id); else if (e.key === 'Escape') hideNewSubSpaceFor(sn.space.id); }}
-              oninput={() => { newSubSpaceFor = { ...newSubSpaceFor, [sn.space.id]: { ...newSubSpaceFor[sn.space.id], error: '' } }; }}
-              class="flex-1 text-xs px-2 py-1.5 rounded-lg outline-none"
-              style="background:var(--color-surface-lo); color:var(--color-on-surface); border:1px solid {newSubSpaceFor[sn.space.id].error ? '#ef4444' : 'var(--color-primary)'};"
-              use:focusOnMount />
-            <button onclick={() => handleCreateSubSpaceFor(sn.space.id)} class="text-xs px-2 py-1 rounded-lg font-semibold text-white" style="background:var(--color-primary);">✓</button>
-            <button onclick={() => hideNewSubSpaceFor(sn.space.id)} class="text-xs px-1.5 py-1" style="color:var(--color-on-muted);">✕</button>
-          </div>
-          {#if newSubSpaceFor[sn.space.id].error}
-            <p class="text-[10px] px-1" style="color:#ef4444;">{newSubSpaceFor[sn.space.id].error}</p>
-          {/if}
+            class="flex items-center gap-1 text-xs px-2 py-0.5 rounded-md transition-colors"
+            style="color:var(--color-on-muted); background:var(--color-surface-lo);"
+            onmouseenter={(e) => (e.currentTarget as HTMLElement).style.color = 'var(--color-primary)'}
+            onmouseleave={(e) => (e.currentTarget as HTMLElement).style.color = 'var(--color-on-muted)'}
+            title="Reset synthesis cache and re-extract all entities">
+            <RefreshCw size={10} />Re-process
+          </button>
         </div>
       {/if}
 
@@ -771,7 +734,7 @@
             {/if}
 
             <div class="flex opacity-0 group-hover:opacity-100 transition-all shrink-0 gap-0.5 pr-1">
-              <button onclick={() => showNewChild(pn.page.id)}
+              <button onclick={() => { createIntent = { kind: 'child-page', parentPageId: pn.page.id, parentPageTitle: pn.page.title, spaceId: $currentSpace!.id }; createName = ''; createError = ''; }}
                 class="w-5 h-5 flex items-center justify-center rounded text-xs"
                 style="color:var(--color-on-muted);"
                 onmouseenter={(e) => (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-lo)'}
@@ -792,18 +755,57 @@
             </div>
           </div>
 
-          {#if newChildState[pn.page.id]?.show}
-            <div class="flex items-center gap-1 pr-2 py-0.5" style="padding-left:{pi + 16}px">
-              <input type="text" bind:value={newChildState[pn.page.id].title} placeholder="Sub-page title"
-                onkeyup={(e) => { if (e.key === 'Enter') handleCreateChildPage(pn.page.id); else if (e.key === 'Escape') hideNewChild(pn.page.id); }}
-                class="flex-1 text-xs px-2 py-1 rounded-lg outline-none"
-                style="background:var(--color-surface-lo); color:var(--color-on-surface); border:1px solid var(--color-primary);"
-                use:focusOnMount />
-              <button onclick={() => handleCreateChildPage(pn.page.id)} class="text-xs px-2 py-1 rounded-lg font-semibold text-white" style="background:var(--color-primary);">✓</button>
-            </div>
-          {/if}
         {/each}
       {/if}
+    {/each}
+
+    <!-- Wiki space — always at bottom, visually separated -->
+    {#each spaceNodes().filter(sn => sn.space.name === 'Wiki') as sn (sn.space.id)}
+      {@const si = sn.depth * 10}
+      {@const isSel = $currentSpace?.id === sn.space.id}
+      <div class="mt-3 pt-2" style="border-top: 1px solid var(--color-border);">
+        <div class="group flex items-center rounded-lg mb-0.5 transition-all" style="padding-left:{si}px;">
+          <button onclick={() => { expandedSpaceIds = toggle(expandedSpaceIds, sn.space.id); }}
+            class="shrink-0 w-5 h-5 flex items-center justify-center rounded transition-colors mr-0.5"
+            style="color:var(--color-on-muted);">
+            {#if sn.hasChildren || expandedSpaceIds.has(sn.space.id)}
+              {#if expandedSpaceIds.has(sn.space.id)}<ChevronDown size={12} />{:else}<ChevronRight size={12} />{/if}
+            {:else}<span class="w-3"></span>{/if}
+          </button>
+          <div class="shrink-0 w-5 h-5 flex items-center justify-center mr-1.5">
+            {#if isSel}<FolderOpen size={14} style="color:var(--color-primary);"/>{:else}<Folder size={14} style="color:var(--color-on-muted);"/>{/if}
+          </div>
+          <button onclick={() => selectSpace(sn.space)}
+            class="flex-1 text-left py-2.5 text-xs font-semibold truncate min-w-0 transition-colors"
+            style="color:{isSel ? 'var(--color-primary)' : 'var(--color-on-muted)'};">
+            Wiki
+          </button>
+          <span class="text-xs px-1.5 py-0.5 rounded mr-1" style="color:var(--color-on-muted); background:var(--color-surface-lo); font-size:10px;">
+            {$pages.filter(p => p.is_entity_page).length || ''}
+          </span>
+        </div>
+        {#if isSel}
+          {@const indent = si + 24}
+          {#each _pageNodes as pn (pn.page.id)}
+            {@const pi = pn.depth * 10 + indent}
+            <div class="flex items-center rounded-lg mb-0.5" style="padding-left:{pi}px;">
+              <button onclick={() => { expandedIds = toggle(expandedIds, pn.page.id); }}
+                class="shrink-0 w-4 h-6 flex items-center justify-center mr-0.5"
+                style="color:var(--color-on-muted);">
+                {#if pn.hasChildren || expandedIds.has(pn.page.id)}
+                  {#if expandedIds.has(pn.page.id)}<ChevronDown size={10} />{:else}<ChevronRight size={10} />{/if}
+                {:else}<span class="w-2"></span>{/if}
+              </button>
+              <FileText size={11} class="shrink-0 mr-1.5" style="color:{$currentPage?.id === pn.page.id ? 'var(--color-primary)' : 'var(--color-on-muted)'};" />
+              <button onclick={() => selectPage(pn.page)}
+                class="flex-1 text-left py-1.5 text-xs truncate min-w-0"
+                style="color:{$currentPage?.id === pn.page.id ? 'var(--color-primary)' : 'var(--color-on-surface)'};">
+                {pn.page.title}
+              </button>
+            </div>
+          {/each}
+        {/if}
+      </div>
     {/each}
 
     <!-- New root space form -->
@@ -951,6 +953,55 @@
           disabled={!moveTargetId}
           class="px-3 py-1.5 text-xs rounded-lg font-semibold text-white disabled:opacity-40"
           style="background:var(--color-primary);">Move</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if createIntent}
+  <div class="fixed inset-0 z-50 flex items-center justify-center" style="background: rgba(0,0,0,0.5);">
+    <div class="rounded-xl p-5 w-80 flex flex-col gap-3 shadow-xl" style="background: var(--color-surface); border: 1px solid var(--color-border);">
+      <div>
+        <p class="text-xs font-semibold uppercase tracking-wide mb-1" style="color: var(--color-on-muted);">
+          {createIntent.kind === 'subspace' ? 'New folder' : 'New page'}
+        </p>
+        <p class="text-xs" style="color: var(--color-on-surface);">
+          Adding to: <span class="font-medium" style="color: var(--color-primary);">
+            {#if createIntent.kind === 'page-in-space'}
+              {createIntent.spaceName}
+            {:else if createIntent.kind === 'subspace'}
+              {createIntent.parentSpaceName}
+            {:else if createIntent.kind === 'child-page'}
+              {$currentSpace?.name} / {createIntent.parentPageTitle}
+            {/if}
+          </span>
+        </p>
+      </div>
+      <input
+        type="text"
+        bind:value={createName}
+        placeholder={createIntent.kind === 'subspace' ? 'Folder name' : 'Page title'}
+        onkeydown={(e) => { if (e.key === 'Enter') handleConfirmCreate(); else if (e.key === 'Escape') { createIntent = null; createName = ''; createError = ''; } }}
+        class="text-sm px-3 py-2 rounded-lg outline-none"
+        style="background: var(--color-surface-lo); border: 1px solid {createError ? '#ef4444' : 'var(--color-primary)'}; color: var(--color-on-surface);"
+        use:focusOnMount
+      />
+      {#if createError}
+        <p class="text-xs" style="color: #ef4444;">{createError}</p>
+      {/if}
+      <div class="flex gap-2 justify-end">
+        <button
+          onclick={() => { createIntent = null; createName = ''; createError = ''; }}
+          class="text-xs px-3 py-1.5 rounded-lg"
+          style="color: var(--color-on-muted); border: 1px solid var(--color-border);">
+          Cancel
+        </button>
+        <button
+          onclick={handleConfirmCreate}
+          class="text-xs px-3 py-1.5 rounded-lg font-semibold text-white"
+          style="background: var(--color-primary);">
+          Create
+        </button>
       </div>
     </div>
   </div>

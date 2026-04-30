@@ -350,7 +350,7 @@ async fn upload_to_gdrive(bytes: Vec<u8>, filename: &str, folder_id: &str, token
         .send()
         .await;
 
-    Ok(format!("https://lh3.googleusercontent.com/d/{file_id}"))
+    Ok(file_id)
 }
 
 /// Download all inline images, optimize, upload to Google Drive, and return
@@ -393,16 +393,25 @@ async fn prefetch_images(doc: &serde_json::Value, token: &str) -> HashMap<String
         }
     };
 
+    let cache_dir = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(home).join(".bamako/image_cache")
+    };
+    std::fs::create_dir_all(&cache_dir).ok();
+
     let mut map = HashMap::new();
     for (id, uri) in uris {
         match download_image_bytes(&uri, token).await {
             Some(bytes) => {
                 let optimized = optimize_image(&bytes);
                 let filename = format!("{id}.jpg");
-                match upload_to_gdrive(optimized, &filename, &folder_id, token).await {
-                    Ok(url) => {
-                        eprintln!("[import] Uploaded image {id} → {url}");
-                        map.insert(id, url);
+                match upload_to_gdrive(optimized.clone(), &filename, &folder_id, token).await {
+                    Ok(file_id) => {
+                        // Cache locally so the bamakimg:// protocol serves instantly
+                        let cache_path = cache_dir.join(format!("{file_id}.jpg"));
+                        std::fs::write(&cache_path, &optimized).ok();
+                        eprintln!("[import] Uploaded image {id} → bamakimg://{file_id}");
+                        map.insert(id, format!("bamakimg://{file_id}"));
                     }
                     Err(e) => eprintln!("[import] Failed to upload image {id}: {e}"),
                 }
@@ -653,17 +662,37 @@ pub async fn import_pages_bulk(
     let mut ids = vec![];
 
     for p in pages {
-        let page_id = nanoid!();
-        let version_id = nanoid!();
-        conn.execute(
-            "INSERT INTO pages (id, title, space_id, creator_id, parent_page_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            libsql::params![page_id.clone(), p.title.clone(), space_id.clone(), DEMO_USER_ID, p.parent_page_id.clone()],
+        // Upsert: find existing non-deleted page with same title and parent
+        let mut ex = conn.query(
+            "SELECT id FROM pages WHERE title = ?1 AND space_id = ?2 AND deleted_at IS NULL \
+             AND (parent_page_id IS ?3) LIMIT 1",
+            libsql::params![p.title.clone(), space_id.clone(), p.parent_page_id.clone()],
         ).await.map_err(|e: libsql::Error| e.to_string())?;
-        conn.execute(
-            "INSERT INTO page_versions (id, page_id, owner_id, title, content, text_content, is_published, is_frozen, version_num) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, 0, 1)",
-            libsql::params![version_id, page_id.clone(), DEMO_USER_ID, p.title, p.content],
-        ).await.map_err(|e: libsql::Error| e.to_string())?;
+
+        let page_id = if let Some(row) = ex.next().await.map_err(|e| e.to_string())? {
+            // Page exists — update its published version content
+            let existing_id: String = row.get(0).map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE page_versions SET content = ?1, text_content = ?1, updated_at = datetime('now') \
+                 WHERE page_id = ?2 AND is_published = 1",
+                libsql::params![p.content.clone(), existing_id.clone()],
+            ).await.map_err(|e: libsql::Error| e.to_string())?;
+            existing_id
+        } else {
+            // New page
+            let new_id = nanoid!();
+            let version_id = nanoid!();
+            conn.execute(
+                "INSERT INTO pages (id, title, space_id, creator_id, parent_page_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                libsql::params![new_id.clone(), p.title.clone(), space_id.clone(), DEMO_USER_ID, p.parent_page_id.clone()],
+            ).await.map_err(|e: libsql::Error| e.to_string())?;
+            conn.execute(
+                "INSERT INTO page_versions (id, page_id, owner_id, title, content, text_content, is_published, is_frozen, version_num) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, 0, 1)",
+                libsql::params![version_id, new_id.clone(), DEMO_USER_ID, p.title, p.content],
+            ).await.map_err(|e: libsql::Error| e.to_string())?;
+            new_id
+        };
         ids.push(page_id);
     }
     Ok(ids)

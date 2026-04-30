@@ -32,6 +32,7 @@ export interface Page {
   /** "owner" | "write" | "read" */
   permission_level: string;
   last_synced_at: string | null;
+  is_entity_page: number;
 }
 
 export interface PageVersion {
@@ -266,6 +267,12 @@ export const setSpaceConfig = (spaceId: string, apiKey: string, model: string, s
 export const synthesizePage = (spaceId: string, pageId: string) =>
   invoke<PageSynthesis>('synthesize_page', { spaceId, pageId });
 
+export const forceResynthesize = (spaceId: string) =>
+  invoke<void>('force_resynthesize', { spaceId });
+
+export const createWikiStubs = (spaceId: string) =>
+  invoke<number>('create_wiki_stubs', { spaceId });
+
 export const getPageSynthesis = (spaceId: string, pageId: string) =>
   invoke<PageSynthesis | null>('get_page_synthesis', { spaceId, pageId });
 
@@ -274,6 +281,9 @@ export const getEntitySuggestions = (spaceId: string) =>
 
 export const promoteEntity = (spaceId: string, entityId: string) =>
   invoke<string>('promote_entity', { spaceId, entityId });
+
+export const demoteEntityPage = (spaceId: string, pageId: string) =>
+  invoke<void>('demote_entity_page', { spaceId, pageId });
 
 export const dismissEntity = (spaceId: string, entityId: string) =>
   invoke<void>('dismiss_entity', { spaceId, entityId });
@@ -286,3 +296,53 @@ export const getSpaceOverview = (spaceId: string) =>
 
 export const getPageLinks = (spaceId: string, pageId: string) =>
   invoke<PageLink[]>('get_page_links', { spaceId, pageId });
+
+// ── Knowledge Graph ───────────────────────────────────────────────────────────
+
+export interface GraphNode {
+  id: string;
+  label: string;
+  node_type: 'page' | 'entity';
+  entity_type?: string;
+  status?: string;
+  mention_count?: number;
+  description?: string;
+}
+
+export interface GraphEdge {
+  source: string;
+  target: string;
+  edge_type: 'mention' | 'link';
+  label?: string;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+export const getGraphData = (spaceId: string) =>
+  invoke<GraphData>('get_graph_data', { spaceId });
+
+// ── Query & Lint ───────────────────────────────────────────────────────────────
+
+export interface WikiAnswer {
+  answer: string;
+  sources: string[];
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface LintResult {
+  orphan_wiki_pages: string[];
+  stale_wiki_pages: string[];
+  unresolved_contradictions: number;
+  high_mention_unlinked: string[];
+  investigation_questions: string[];
+  suggested_sources: string[];
+}
+
+export const askWiki = (spaceId: string, question: string) =>
+  invoke<WikiAnswer>('ask_wiki', { spaceId, question });
+
+export const lintSpace = (spaceId: string) =>
+  invoke<LintResult>('lint_space', { spaceId });
