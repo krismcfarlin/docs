@@ -1,0 +1,26 @@
+services:
+  sqld-shared:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    platform: linux/amd64
+    command: ["sqld", "--http-listen-addr", "0.0.0.0:8080"]
+    ports:
+      - "8093:8080"    # shared namespace
+    environment:
+      - SQLD_NODE=primary
+    volumes:
+      - sqld-sim-shared:/var/lib/sqld
+
+  sqld-alice:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    platform: linux/amd64
+    command: ["sqld", "--http-listen-addr", "0.0.0.0:8080"]
+    ports:
+      - "8095:8080"    # alice-private namespace
+    environment:
+      - SQLD_NODE=primary
+    volumes:
+      - sqld-sim-alice:/var/lib/sqld
+
+volumes:
+  sqld-sim-shared:
+  sqld-sim-alice:

@@ -1,0 +1,15 @@
+services:
+  sqld:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    platform: linux/amd64
+    ports:
+      - "8093:8080"    # HTTP API (libsql client)
+      - "5001:5001"    # gRPC (replication)
+    command: ["sqld", "--http-listen-addr", "0.0.0.0:8080"]
+    environment:
+      - SQLD_NODE=primary
+    volumes:
+      - sqld-data:/var/lib/sqld
+
+volumes:
+  sqld-data:

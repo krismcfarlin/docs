@@ -1,0 +1,35 @@
+services:
+  sqld:
+    image: ghcr.io/tursodatabase/libsql-server:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    command:
+      - sqld
+      - --http-listen-addr=0.0.0.0:8080
+      - --auth-jwt-key-file=/etc/sqld/jwt-key
+    environment:
+      - SQLD_NODE=primary
+    volumes:
+      - sqld-data:/var/lib/sqld
+      - ./config/jwt-key:/etc/sqld/jwt-key:ro
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - sqld
+
+volumes:
+  sqld-data:
+  caddy-data:
+  caddy-config:

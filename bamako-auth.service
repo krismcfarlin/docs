@@ -1,0 +1,30 @@
+[Unit]
+Description=Bamako auth service (Google → sqld JWT exchange)
+After=network.target bamako-sqld.service
+
+[Service]
+Type=simple
+User=bamako
+Group=bamako
+WorkingDirectory=/opt/bamako
+EnvironmentFile=/opt/bamako/auth.env
+
+ExecStart=/opt/bamako/bamako-auth
+
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=5min
+StartLimitBurst=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bamako
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bamako-auth
+
+[Install]
+WantedBy=multi-user.target
